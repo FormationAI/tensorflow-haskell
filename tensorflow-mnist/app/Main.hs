@@ -14,8 +14,9 @@
 
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedLists #-}
+{-# LANGUAGE TypeApplications #-}
 
-import Control.Monad (zipWithM, when, forM_)
+import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Int (Int32, Int64)
 import Data.List (genericLength)
@@ -23,8 +24,9 @@ import qualified Data.Text.IO as T
 import qualified Data.Vector as V
 
 import qualified TensorFlow.Core as TF
-import qualified TensorFlow.Gradient as TF
-import qualified TensorFlow.Ops as TF
+import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializedVariable)
+import qualified TensorFlow.Variable as TF
+import qualified TensorFlow.Minimize as TF
 
 import TensorFlow.Examples.MNIST.InputData
 import TensorFlow.Examples.MNIST.Parse
@@ -39,9 +41,6 @@ randomParam width (TF.Shape shape) =
     (`TF.mul` stddev) <$> TF.truncatedNormal (TF.vector shape)
   where
     stddev = TF.scalar (1 / sqrt (fromIntegral width))
-
-reduceMean :: TF.Tensor TF.Build Float -> TF.Tensor TF.Build Float
-reduceMean xs = TF.mean xs (TF.scalar (0 :: Int32))
 
 -- Types must match due to model structure.
 type LabelType = Int32
@@ -68,30 +67,28 @@ createModel = do
     hiddenWeights <-
         TF.initializedVariable =<< randomParam numPixels [numPixels, numUnits]
     hiddenBiases <- TF.zeroInitializedVariable [numUnits]
-    let hiddenZ = (images `TF.matMul` hiddenWeights) `TF.add` hiddenBiases
+    let hiddenZ = (images `TF.matMul` TF.readValue hiddenWeights)
+                  `TF.add` TF.readValue hiddenBiases
     let hidden = TF.relu hiddenZ
     -- Logits.
     logitWeights <-
         TF.initializedVariable =<< randomParam numUnits [numUnits, numLabels]
     logitBiases <- TF.zeroInitializedVariable [numLabels]
-    let logits = (hidden `TF.matMul` logitWeights) `TF.add` logitBiases
-    predict <- TF.render $ TF.cast $
+    let logits = (hidden `TF.matMul` TF.readValue logitWeights)
+                 `TF.add` TF.readValue logitBiases
+    predict <- TF.render @TF.Build @LabelType $
                TF.argMax (TF.softmax logits) (TF.scalar (1 :: LabelType))
 
     -- Create training action.
     labels <- TF.placeholder [batchSize]
     let labelVecs = TF.oneHot labels (fromIntegral numLabels) 1 0
         loss =
-            reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
+            TF.reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
         params = [hiddenWeights, hiddenBiases, logitWeights, logitBiases]
-    grads <- TF.gradients loss params
-
-    let lr = TF.scalar 0.00001
-        applyGrad param grad = TF.assign param $ param `TF.sub` (lr `TF.mul` grad)
-    trainStep <- TF.group =<< zipWithM applyGrad params grads
+    trainStep <- TF.minimizeWith TF.adam loss params
 
     let correctPredictions = TF.equal predict labels
-    errorRateTensor <- TF.render $ 1 - reduceMean (TF.cast correctPredictions)
+    errorRateTensor <- TF.render $ 1 - TF.reduceMean (TF.cast correctPredictions)
 
     return Model {
           train = \imFeed lFeed -> TF.runWithFeeds_ [

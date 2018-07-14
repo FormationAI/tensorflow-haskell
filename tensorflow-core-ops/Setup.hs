@@ -11,6 +11,7 @@
 -- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
+{-# LANGUAGE CPP #-}
 
 -- | Generates the wrappers for Ops shipped with tensorflow.
 module Main where
@@ -20,7 +21,7 @@ import Distribution.PackageDescription
     , libBuildInfo
     , hsSourceDirs
     )
-import Distribution.Simple.BuildPaths (autogenModulesDir)
+import qualified Distribution.Simple.BuildPaths as BuildPaths
 import Distribution.Simple.LocalBuildInfo (LocalBuildInfo)
 import Distribution.Simple
     ( defaultMainWithHooks
@@ -89,5 +90,31 @@ fudgePackageDesc lbi p = p
 
 blackList =
     [ -- Requires the "func" type:
-      "SymbolicGradient"
+      "FilterDataset"
+    , "FlatMapDataset"
+    , "For"
+    , "GeneratorDataset"
+    , "GroupByWindowDataset"
+    , "If"
+    , "InterleaveDataset"
+    , "MapAndBatchDataset"
+    , "MapDataset"
+    , "MapDataset"
+    , "OneShotIterator"
+    , "ParallelInterleaveDataset"
+    , "ParallelMapDataset"
+    , "RemoteCall"
+    , "ScanDataset"
+    , "SymbolicGradient"
+    , "TPUReplicate"
+    , "While"
+    , "_If"
+    , "_While"
     ]
+
+autogenModulesDir :: LocalBuildInfo -> FilePath
+#if MIN_VERSION_Cabal(2,0,0)
+autogenModulesDir = BuildPaths.autogenPackageModulesDir
+#else
+autogenModulesDir = BuildPaths.autogenModulesDir
+#endif

@@ -19,6 +19,7 @@
 
 import Data.Int (Int32, Int64)
 import Data.List (sort)
+import qualified Data.List as List
 import Data.ProtoLens.TextFormat (showMessage)
 import Test.Framework (defaultMain, Test)
 import Lens.Family2 ((^..), (.~))
@@ -26,17 +27,22 @@ import Lens.Family2 ((^..), (.~))
 import Test.Framework.Providers.HUnit (testCase)
 import Test.HUnit ((@=?), assertEqual)
 import qualified Data.Vector as V
+import System.Random (randomIO, randomRIO)
+import Control.Monad(forM_, replicateM, zipWithM)
 import Control.Monad.IO.Class (liftIO)
 
 import qualified TensorFlow.Core as TF
-import qualified TensorFlow.GenOps.Core as TF (max, tile)
+import qualified TensorFlow.GenOps.Core as TF (conv2DBackpropInput', max, maximum, tile)
 import qualified TensorFlow.Gradient as TF
-import qualified TensorFlow.Ops as TF
+import qualified TensorFlow.Ops as TF hiding (zeroInitializedVariable)
 import qualified TensorFlow.Output as TF
 import qualified TensorFlow.Types as TF
+import qualified TensorFlow.Variable as TF
 
 import Proto.Tensorflow.Core.Framework.Graph (node)
 import Proto.Tensorflow.Core.Framework.NodeDef (op)
+
+import qualified Data.ByteString.Char8 as BS
 
 testGradientSimple :: Test
 testGradientSimple = testCase "testGradientSimple" $ do
@@ -155,6 +161,15 @@ testDiamond = testCase "testDiamond" $ do
     (4 :: Float) @=? TF.unScalar dx
 
 
+testAddNGradient :: Test
+testAddNGradient = testCase "testAddNGradient" $ do
+    [dx] <- TF.runSession $ do
+        x <- TF.render $ TF.vector [1, 2, 0 :: Float]
+        let y = TF.addN [x, x]
+        TF.gradients y [x] >>= TF.run
+    V.fromList [2, 2, 2 :: Float] @=? dx
+
+
 testMaxGradient :: Test
 testMaxGradient = testCase "testMaxGradient" $ do
     [dx] <- TF.runSession $ do
@@ -163,6 +178,92 @@ testMaxGradient = testCase "testMaxGradient" $ do
         TF.gradients y [x] >>= TF.run
     V.fromList [0, 0, 1, 0, 0 :: Float] @=? dx
 
+testConcatGradient :: Test
+testConcatGradient = testCase "testConcatGradient" $ do
+    [dv,dv'] <- TF.runSession $ do
+        v  <- TF.render $ TF.vector [1 :: Float]
+        v' <- TF.render $ TF.vector [2 :: Float]
+        let y = TF.concat (TF.scalar 0) [ v, v' ]
+        TF.gradients y [v,v'] >>= TF.run
+    V.fromList [1 :: Float] @=? dv
+    V.fromList [1 :: Float] @=? dv'
+    [dw,dw'] <- TF.runSession $ do
+        w  <- TF.render $ TF.vector [1,2,3,4 :: Float]
+        w' <- TF.render $ TF.vector [5,6,7,8 :: Float]
+        let y = TF.concat (TF.scalar 0) [ w, w', w ]
+        TF.gradients y [w,w'] >>= TF.run
+    V.fromList [2,2,2,2 :: Float] @=? dw
+    V.fromList [1,1,1,1 :: Float] @=? dw'
+
+verifyConcatGradients :: [[Int64]] -> Int32  -> IO ()
+verifyConcatGradients shapes concatDim = do
+    let floatsFromShape :: [Int64] -> IO [Float]
+        floatsFromShape shape = replicateM (fromIntegral $ List.product shape) randomIO
+        constantZip = zipWithM $ \x shape -> TF.render $ TF.constant (TF.Shape shape) x
+    inputGrads <- mapM floatsFromShape shapes
+    inputs     <- mapM floatsFromShape shapes
+    dinputs <- TF.runSession $ do
+        inputTensors     <- inputs `constantZip` shapes
+        inputGradTensors <- inputGrads `constantZip` shapes
+        inputTensor      <- TF.render $ TF.concat (TF.scalar concatDim) inputTensors
+        inputGradTensor  <- TF.render $ TF.concat (TF.scalar concatDim) inputGradTensors
+        output           <- TF.render $ inputTensor `TF.mul` inputGradTensor
+        TF.gradients output inputTensors >>= TF.run
+    (V.fromList <$> inputGrads) @=? dinputs
+
+-- This test checks that the gradient of a concat op
+--   is correct along the first, second, and third dimension.
+testConcatGradientSimple :: Test
+testConcatGradientSimple = testCase "testConcatGradientSimple" $ do
+    --   The following check is equivalent to ConcatTest._testGradientsSimple from
+    --   tensorflow/tensorflow/compiler/tests/concat_ops_test.py
+    verifyConcatGradients [[10,x,2] | x <- [1,2,6]] 1
+    --   The following check is equivalent to ConcatTest._testGradientsFirstDim from
+    --   tensorflow/tensorflow/compiler/tests/concat_ops_test.py
+    verifyConcatGradients [[x,10,2] | x <- [1,2,6]] 0
+    --   The following check is equivalent to ConcatTest._testGradientsLastDim from
+    --   tensorflow/tensorflow/compiler/tests/concat_ops_test.py
+    verifyConcatGradients [[10,2,x] | x <- [1,2,6]] 2
+
+
+-- This test checks that the gradient of a concat op
+--   along a random dimension across random shapes is as expected.
+--   This test is inspired by ConcatTest._RunAndVerifyGradientsRandom from
+--   tensorflow/tensorflow/compiler/tests/concat_ops_test.py, but also
+--   verifies the gradient along negative concat dimensions.
+testConcatRunAndVerifyGradientsRandom :: Test
+testConcatRunAndVerifyGradientsRandom = testCase "testConcatRunAndVerifyGradientsRandom" $
+    forM_ [1..5 :: Int] $ \_ -> do
+        (shapes' :: [Int64]) <- replicateM 5 $ randomRIO (1, 5)
+        (numTensors :: Int)  <- randomRIO (2, 10)
+        (concatDim :: Int)   <- randomRIO (-4, 4)
+        (concatDimSizes :: [Int64]) <- replicateM numTensors $ randomRIO (1, 5)
+        let update i xs x = take i xs ++ x: drop (i+1) xs
+            concatDim'    = concatDim `mod` length shapes'
+            shapes        = map (update concatDim' shapes') concatDimSizes
+        verifyConcatGradients shapes $ fromIntegral concatDim
+
+-- run single test like this:
+-- stack --docker --docker-image=$IMAGE_NAME test tensorflow-ops:GradientTest --test-arguments -t"*MaximumGrad*"
+testMaximumGrad :: Test
+testMaximumGrad = testCase "testMaximumGrad" $ do
+    [gx, gy] <- TF.runSession $ do
+        x <- TF.render $ TF.vector [0 :: Float]
+        y <- TF.render $ TF.vector [0 :: Float]
+        let z = TF.maximum x y
+        TF.gradients z [x, y] >>= TF.run
+    V.fromList [1] @=? gx
+    V.fromList [1] @=? gy
+
+testMaximumGradGrad :: Test
+testMaximumGradGrad = testCase "testMaximumGradGrad" $ do
+    [ggx] <- TF.runSession $ do
+        x <- TF.render $ TF.vector [2 :: Float]
+        y <- TF.render $ TF.vector [1 :: Float]
+        let z = TF.maximum x y
+        [gx, _gy] <- TF.gradients z [x, y]
+        TF.gradients gx [x] >>= TF.run
+    V.fromList [0] @=? ggx
 
 testReluGrad :: Test
 testReluGrad = testCase "testReluGrad" $ do
@@ -180,7 +281,6 @@ testReluGradGrad = testCase "testReluGradGrad" $ do
         [y'] <- TF.gradients y [x]
         TF.gradients y' [x] >>= TF.run
     V.fromList [0] @=? dx
-
 
 testFillGrad :: Test
 testFillGrad = testCase "testFillGrad" $ do
@@ -215,14 +315,13 @@ testTile2DGrad = testCase "testTileGrad2D" $ do
     shapeX @=? (shapeDX :: V.Vector Int32)
     V.fromList [6, 6, 6, 6, 6, 6::Float] @=? (dx :: V.Vector Float)
 
-
 matMulGradient :: Test
 matMulGradient = testCase "matMulGradients" $ do
 
   let dfBuild = do
         x <- TF.render $ TF.zeros $ TF.Shape [3, 1 :: Int64]
         w <- TF.zeroInitializedVariable $ TF.Shape [1, 2 :: Int64]
-        let f = x `TF.matMul` w :: TF.Tensor TF.Build Float
+        let f = x `TF.matMul` TF.readValue w :: TF.Tensor TF.Build Float
         dfs <- TF.gradients f [x]
         return (x, dfs)
 
@@ -242,11 +341,11 @@ matMulGradGrad = testCase "matMulGradGrad" $ do
   let tower = do
         x <- TF.render $ TF.zeros $ TF.Shape [batch, 1]
         w <- TF.zeroInitializedVariable $ TF.Shape [1, width]
-        let f = x `TF.matMul` w
+        let f = x `TF.matMul` TF.readValue w
         [dfdx] <- TF.gradients f [x]
         let f'x = TF.reduceSum dfdx
         [dfdw] <- TF.gradients f'x [w] -- take gradient again (this time over w)
-        return [TF.value w, dfdw]
+        return [TF.readValue w, TF.expr dfdw]
 
   TF.runSession $ do
     [w, dfdw] <- TF.build tower
@@ -255,12 +354,12 @@ matMulGradGrad = testCase "matMulGradGrad" $ do
 
     let step = w `TF.add` dfdw
     w0 <- TF.run step
-    liftIO $ ((V.fromList [4, 4 :: Float]) @=? w0)
+    liftIO $ V.fromList [4, 4 :: Float] @=? w0
 
 
 -- test that gradient of matMul deals correctly with transpose_a and transpose_b
 matMulTransposeGradient :: (Bool, Bool) -> Test
-matMulTransposeGradient txw = testCase ("matMulTransposeGradients " ++ (show txw)) $ do
+matMulTransposeGradient txw = testCase ("matMulTransposeGradients " ++ show txw) $ do
   let (transposeX, transposeW) = txw
 
   let dfBuild = do
@@ -268,7 +367,7 @@ matMulTransposeGradient txw = testCase ("matMulTransposeGradients " ++ (show txw
         let xZeros = TF.zeros xShape
         x <- TF.render $ if transposeX then TF.matTranspose xZeros else xZeros
         variable <- TF.zeroInitializedVariable $ TF.Shape [1, 2 :: Int64]
-        let wv = if transposeW then TF.matTranspose variable else TF.expr variable
+        let wv = if transposeW then TF.matTranspose (TF.readValue variable) else TF.readValue variable
         let f = TF.matMul' (transAttrs transposeX transposeW) x wv :: TF.Tensor TF.Build Float
         w <- TF.render wv
         ds <- TF.gradients f [x, w]
@@ -290,6 +389,28 @@ transAttrs :: (TF.Attribute a,
 transAttrs a b =
   (TF.opAttr "transpose_a" .~ a) . (TF.opAttr "transpose_b" .~ b)
 
+testConv2DBackpropInputGrad :: Test
+testConv2DBackpropInputGrad = testCase "testConv2DBackpropInputGrad" $ do
+    (dx, shapeDX, shapeX) <- TF.runSession $ do
+        let conv_input_shape = TF.vector [1, 2, 2, 1 :: Int32] -- [batch, h, w, in_channels]
+        let conv_out_shape = TF.vector [1, 1, 1, 1 :: Int32]  -- [batch, h, w, out_channels]
+        x <- TF.render $ TF.fill conv_out_shape (TF.scalar (1::Float))
+
+        let filterShape = TF.vector [2, 2, 1, 1 :: Int32] -- [fh, fw, inc, out]
+        filter' <- TF.render $ TF.fill filterShape (TF.scalar (1::Float))
+        let y = TF.conv2DBackpropInput'
+                ( (TF.opAttr "strides" .~ [1::Int64, 1, 1, 1])
+                . (TF.opAttr "padding" .~ (BS.pack "VALID"))
+                . (TF.opAttr "data_format" .~ (BS.pack "NHWC"))
+                )
+                conv_input_shape filter' x
+
+        [dx] <- TF.gradients y [x]
+        TF.run (dx, TF.shape dx, TF.shape x)
+    shapeX @=? (shapeDX :: V.Vector Int32)
+    V.fromList [4::Float] @=? (dx :: V.Vector Float)
+
+
 main :: IO ()
 main = defaultMain
             [ testGradientSimple
@@ -297,7 +418,13 @@ main = defaultMain
             , testCreateGraphStateful
             , testCreateGraphNameScopes
             , testDiamond
+            , testAddNGradient
             , testMaxGradient
+            , testConcatGradient
+            , testConcatGradientSimple
+            , testConcatRunAndVerifyGradientsRandom
+            , testMaximumGrad
+            , testMaximumGradGrad
             , testReluGrad
             , testReluGradGrad
             , testFillGrad
@@ -309,4 +436,5 @@ main = defaultMain
             , matMulTransposeGradient (False, True)
             , matMulTransposeGradient (True, False)
             , matMulTransposeGradient (True, True)
+            , testConv2DBackpropInputGrad
             ]

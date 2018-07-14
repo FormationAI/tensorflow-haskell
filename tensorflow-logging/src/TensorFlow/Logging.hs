@@ -33,15 +33,19 @@
 -- >                 TF.logSummary eventWriter step summary
 -- >             else TF.run_ trainStep
 
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
+
 
 module TensorFlow.Logging
     ( EventWriter
     , withEventWriter
     , logEvent
+    , logGraph
     , logSummary
     , SummaryTensor
     , histogramSummary
+    , imageSummary
     , scalarSummary
     , mergeAllSummaries
     ) where
@@ -54,24 +58,25 @@ import Control.Monad.Catch (MonadMask, bracket)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Resource (runResourceT)
 import Data.ByteString (ByteString)
-import Data.Conduit ((=$=))
+import Data.Conduit ((.|))
 import Data.Conduit.TQueue (sourceTBMQueue)
 import Data.Default (def)
 import Data.Int (Int64)
+import Data.Word (Word8, Word16)
 import Data.ProtoLens (encodeMessage)
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Lens.Family2 ((.~), (&))
 import Network.HostName (getHostName)
 import Proto.Tensorflow.Core.Framework.Summary (Summary)
-import Proto.Tensorflow.Core.Util.Event (Event, fileVersion, step, summary, wallTime)
+import Proto.Tensorflow.Core.Util.Event (Event, fileVersion, graphDef, step, summary, wallTime)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
-import TensorFlow.Build (MonadBuild)
+import TensorFlow.Build (MonadBuild, Build, asGraphDef)
 import TensorFlow.Ops (scalar)
 import TensorFlow.Records.Conduit (sinkTFRecords)
 import TensorFlow.Tensor (Tensor, render, SummaryTensor, addSummary, collectAllSummaries)
-import TensorFlow.Types (TensorType, type(/=))
+import TensorFlow.Types (TensorType, type(/=), OneOf)
 import Text.Printf (printf)
 import qualified Data.ByteString.Lazy as L
 import qualified Data.Conduit as Conduit
@@ -108,8 +113,8 @@ newEventWriter logdir = do
     let writer = EventWriter q done
         consumeQueue = runResourceT $ Conduit.runConduit $
             sourceTBMQueue q
-            =$= Conduit.map (L.fromStrict . encodeMessage)
-            =$= sinkTFRecords filename
+            .| Conduit.map (L.fromStrict . encodeMessage)
+            .| sinkTFRecords filename
     _ <- forkFinally consumeQueue (\_ -> putMVar done ())
     logEvent writer $ def & wallTime .~ t
                           & fileVersion .~ T.pack "brain.Event:2"
@@ -122,6 +127,14 @@ closeEventWriter (EventWriter q done) =
 -- | Logs the given Event protocol buffer.
 logEvent :: MonadIO m => EventWriter -> Event -> m ()
 logEvent (EventWriter q _) pb = liftIO (atomically (writeTBMQueue q pb))
+
+-- | Logs the graph for the given 'Build' action.
+logGraph :: MonadIO m => EventWriter -> Build a -> m ()
+logGraph writer build = do
+  let graph = asGraphDef build
+      graphBytes = encodeMessage graph
+      graphEvent = (def :: Event) & graphDef .~ graphBytes
+  logEvent writer graphEvent
 
 -- | Logs the given Summary event with an optional global step (use 0 if not
 -- applicable).
@@ -145,6 +158,16 @@ histogramSummary ::
      -- OneOf '[Int16, Int32, Int64, Int8, Word16, Word8, Double, Float] t)
     => ByteString -> Tensor v t -> m ()
 histogramSummary tag = addSummary . CoreOps.histogramSummary (scalar tag)
+
+-- | Adds a 'CoreOps.imageSummary' node. The tag argument is intentionally
+-- limited to a single value for simplicity.
+imageSummary ::
+    (OneOf '[Word8, Word16, Float] t, MonadBuild m)
+    => ByteString
+    -> Tensor v t
+    -> m ()
+
+imageSummary tag = addSummary . CoreOps.imageSummary (scalar tag)
 
 -- | Adds a 'CoreOps.scalarSummary' node.
 scalarSummary ::

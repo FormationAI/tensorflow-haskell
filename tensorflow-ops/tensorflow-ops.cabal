@@ -17,6 +17,7 @@ library
   exposed-modules: TensorFlow.Gradient
                  , TensorFlow.Ops
                  , TensorFlow.EmbeddingOps
+                 , TensorFlow.Minimize
                  , TensorFlow.NN
                  , TensorFlow.Queue
                  , TensorFlow.Variable
@@ -187,8 +188,10 @@ Test-Suite GradientTest
   hs-source-dirs: tests
   build-depends: HUnit
                , base
+               , bytestring
                , proto-lens
                , lens-family
+               , random
                , tensorflow
                , tensorflow-core-ops
                , tensorflow-ops

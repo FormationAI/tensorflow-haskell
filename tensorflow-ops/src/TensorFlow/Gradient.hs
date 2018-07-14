@@ -22,7 +22,8 @@
 {-# LANGUAGE ViewPatterns #-}
 
 module TensorFlow.Gradient
-    ( gradients
+    ( GradientCompatible
+    , gradients
     ) where
 
 import Control.Monad (forM, zipWithM)
@@ -99,6 +100,7 @@ import TensorFlow.Tensor
     , tensorNodeName
     , renderedOutput
     , renderValue
+    , ToTensor(..)
     )
 import TensorFlow.Types (Attribute, OneOf, TensorType, attrLens)
 import Proto.Tensorflow.Core.Framework.NodeDef
@@ -116,12 +118,13 @@ type GradientCompatible a =
 
 
 -- | Gradient of @y@ w.r.t. each element of @xs@.
-gradients :: forall a v1 v2 m . (MonadBuild m
-                              , Rendered v2
-                              , GradientCompatible a
-                              )
+gradients :: forall a v1 t m . ( MonadBuild m
+                               , Rendered t
+                               , ToTensor t
+                               , GradientCompatible a
+                               )
           => Tensor v1 a  -- ^ The output of the graph.
-          -> [Tensor v2 a]  -- ^ Tensors for which gradients are computed.
+          -> [t a]        -- ^ Tensors for which gradients are computed.
           -> m [Tensor Value a]
 gradients y xs = build $ do
     -- The gradients are computed using "reverse accumulation", similarly to
@@ -171,10 +174,9 @@ gradients y xs = build $ do
     gradientMap <- graphGrads gr initPending
     -- Lookup the gradients for each x.
     forM xs $ \x ->
-        let xName = tensorNodeName x
-        in maybe (render $ zerosLike x) return $ do
+        let Output i xName = renderedOutput x
+        in maybe (render $ zerosLike $ toTensor x) return $ do
             n <- nodeMap ^. at xName
-            let i = outputIndex $ renderedOutput x
             gradientMap ^. at n . nonEmpty . outputIxAt i
 
 outputIxAt :: OutputIx -> Lens' (IntMap.IntMap v) (Maybe v)
@@ -429,6 +431,22 @@ flatSlice t begin size = CoreOps.slice t (vector [begin]) (vector [size])
 nodeDefName :: NodeDef -> NodeName
 nodeDefName = NodeName . view name
 
+-- | Gradient helper for binary component wise operations
+-- See https://github.com/tensorflow/tensorflow/blob/e9de087fa7f59c39bbe12ac2c83c5547c83f746c/tensorflow/core/ops/math_grad.cc#L329
+gradForBinaryCwise :: ( OneOf '[ Int32, Int64, Float, Double, Complex Float, Complex Double ] t
+                      )
+                   => (Tensor v1 t, Tensor v1 t)
+                   -> (Tensor v1 t, Tensor v1 t)
+                   -> [ Maybe (Tensor Build t) ]
+gradForBinaryCwise (x, gx) (y, gy) =
+    [ Just dx
+    , Just dy ]
+  where
+    dx = reshape (sum gx rx) sx
+    dy = reshape (sum gy ry) sy
+    sx = shape x
+    sy = shape y
+    (rx, ry) = broadcastGradientArgs sx sy
 
 -- | The gradient function for an op type.
 --
@@ -440,6 +458,39 @@ opGrad "Abs" _ [toT -> x] [dz] = [Just $ expr dz * signum x]
 opGrad "Neg" _ [_] [dz] = [Just $ negate $ expr dz]
 opGrad "Relu" _ [toT -> x] [dz] = [Just $ reluGrad dz x]
 opGrad "ReluGrad" _ [_, toT -> x ] [dz] = [Just $ reluGrad dz x, Just $ CoreOps.zerosLike x]
+
+opGrad "Concat" _ _ix [dy]
+    -- Concat concatenates input tensors
+    --   x1 of shape s1 = [k1, ..., ki_1, ..., kn]
+    --   x2 of shape s2 = [k1, ..., ki_2, ..., kn]
+    --    .           .     .          .        .
+    --    .           .     .          .        .
+    --    .           .     .          .        .
+    --   xm of shape sm = [k1, ..., ki_m, ..., kn]
+    --  along dimension i to an output tensor
+    --   y  of shape sy = [k1, ..., k, ..., kn]
+    --  where k = sum ki = sum [ki_1,...,ki_m]
+    --
+    --  The incoming gradient dy from backpropagation is
+    --   simply forwarded split across input tensors yielding dx.
+    --   Forwarded gradients have shapes s = [s1, ..., sm].
+    | m == 1    = Nothing : [Just $ expr dy]
+    | otherwise = Nothing : map Just (dx `reshapeZip` s)
+  where
+    reshapeZip = zipWith reshape
+    dx = CoreOps.splitV (fromIntegral m) dy ki _i
+    s  :: [Tensor Build Int32]
+    s  = map shape x
+    x  :: [Tensor Build a]
+    x  = map toT $ tail _ix
+    -- i: concat dimension. Adjusted modulo n to handle negative indices.
+    _i = toT (head _ix) `CoreOps.floorMod` n
+    i  = reshape _i $ vector [1 :: Int32]
+    -- sizes along concatenated dimension
+    ki :: Tensor Build Int32
+    ki = CoreOps.concat 0 $ map (\t -> CoreOps.slice t i $ vector [1 :: Int32]) s
+    m  = length x
+    n  = CoreOps.rank (head x)
 
 opGrad "Square" _ [toT -> x] [dz] =
     -- TODO(fmayle): Handle complex numbers.
@@ -481,6 +532,15 @@ opGrad "Max" _ [toT -> x, toT -> indices] [dz] =
 -- Min and Max have identical gradient implementations.
 opGrad "Min" u v w = opGrad "Max" u v w
 
+-- Element wise maximum gradient
+-- See https://github.com/tensorflow/tensorflow/blob/e9de087fa7f59c39bbe12ac2c83c5547c83f746c/tensorflow/core/ops/math_grad.cc#L473
+opGrad "Maximum" _ [toT -> x, toT -> y] [dz] =
+    gradForBinaryCwise (x, gx) (y, gy)
+  where
+    xmask = CoreOps.greaterEqual x y
+    gx = CoreOps.select xmask dz (CoreOps.zerosLike dz)
+    gy = CoreOps.select (CoreOps.logicalNot xmask) dz (CoreOps.zerosLike dz)
+
 opGrad "Sum" _ [toT -> x, toT -> indices] [dz] =
     [ Just $ CoreOps.tile grad tileScaling, Nothing ]
   where
@@ -508,6 +568,11 @@ opGrad "Add" _ [toT -> x, toT -> y] [dz] =
     sx = shape (x :: Tensor Build a)
     sy = shape (y :: Tensor Build a)
     (rx, ry) = broadcastGradientArgs sx sy
+
+-- Copies the gradients to all inputs
+-- Not broadcasting
+opGrad "AddN" _ inputs [dz] =
+    map ((const . Just . expr) dz) inputs
 
 opGrad "Sub" u v w =
     [Just x, Just (-y)]
@@ -578,6 +643,27 @@ opGrad "Conv2D" nodeDef [toT -> x, toT -> y] [dz] =
                     . (opAttr "use_cudnn_on_gpu" .~ useCudnnOnGpu)
                     . (opAttr "data_format" .~ dataFormat))
                 x (shape y) dz
+    ]
+  where
+    strides = lookupAttr nodeDef "strides" :: [Int64]
+    padding = lookupAttr nodeDef "padding" :: ByteString
+    useCudnnOnGpu = lookupAttr nodeDef "use_cudnn_on_gpu" :: Bool
+    dataFormat = lookupAttr nodeDef "data_format" :: ByteString
+
+opGrad "Conv2DBackpropInput" nodeDef [_, toT -> x, toT -> y] [dz] =
+    [ Nothing
+    , Just $ CoreOps.conv2DBackpropFilter'
+                ((opAttr "strides" .~ strides)
+                    . (opAttr "padding" .~ padding)
+                    . (opAttr "use_cudnn_on_gpu" .~ useCudnnOnGpu)
+                    . (opAttr "data_format" .~ dataFormat))
+                dz (shape x) y
+    , Just $ CoreOps.conv2D'
+                ((opAttr "strides" .~ strides)
+                    . (opAttr "padding" .~ padding)
+                    . (opAttr "use_cudnn_on_gpu" .~ useCudnnOnGpu)
+                    . (opAttr "data_format" .~ dataFormat))
+                dz x
     ]
   where
     strides = lookupAttr nodeDef "strides" :: [Int64]
@@ -687,9 +773,16 @@ opGrad "Fill" _ _ [dz] = [Nothing, Just $ sum dz rx]
   where
     rx = rangeOfRank dz
 
+-- Treat read ops as an identity function on the variable. This allows us to
+-- take gradients w.r.t. to the variable handle instead of the result of a read
+-- op. If a variable is read multiple times, the gradients will propagate back
+-- through each read.
+opGrad "ReadVariableOp" _ _ [dz] = [Just $ expr dz]
+
 -- TODO(fmayle): These can go away if we properly prune the graph.
 opGrad "Const" _ _ _ = [Nothing, Nothing]
 opGrad "Placeholder" _ _ _ = []
+opGrad "VarHandleOp" _ _ _ = []
 opGrad "Variable" _ _ _ = []
 
 opGrad n nodeDef ins grads =
@@ -702,9 +795,12 @@ numOutputs o =
     case o ^. op of
         "Abs" -> 1
         "Add" -> 1
+        "AddN" -> 1
         "Cast" -> 1
         "Const" -> 1
+        "Concat" -> 1
         "Conv2D" -> 1
+        "Conv2DBackpropInput" -> 1
         "Div" -> 1
         "DynamicStitch" -> 1
         "DynamicPartition" ->
@@ -716,6 +812,7 @@ numOutputs o =
         "Log" -> 1
         "MatMul" -> 1
         "Max" -> 1
+        "Maximum" -> 1
         "MaxPool" -> 1
         "Mean" -> 1
         "Min" -> 1
@@ -723,6 +820,7 @@ numOutputs o =
         "Neg" -> 1
         "Placeholder" -> 1
         "OneHot" -> 1
+        "ReadVariableOp" -> 1
         "RefIdentity" -> 1
         "Relu" -> 1
         "ReluGrad" -> 1
@@ -737,10 +835,11 @@ numOutputs o =
         "Tile" -> 1
         "Transpose" -> 1
         "TruncatedNormal" -> 1
+        "VarHandleOp" -> 1
         "Variable" -> 1
         "ZerosLike" -> 1
         "Fill" -> 1
-        _ -> error $ "numOuputs not implemented for " ++ show (o ^. op)
+        _ -> error $ "numOutputs not implemented for " ++ show (o ^. op)
 
 -- Divides `x / y` assuming `x, y >= 0`, treating `0 / 0 = 0`
 safeShapeDiv :: Tensor v1 Int32 -> Tensor v2 Int32 -> Tensor Build Int32

@@ -106,6 +106,8 @@ module TensorFlow.Ops
     , CoreOps.range
     , CoreOps.range'
     , reducedShape
+    , reduceMean
+    , reduceMean'
     , CoreOps.relu
     , CoreOps.relu'
     , CoreOps.reluGrad
@@ -241,8 +243,8 @@ zeroInitializedVariable'
 zeroInitializedVariable' params = initializedVariable' params . zeros
 
 -- TODO: Support heterogeneous list of tensors.
-save :: forall a m v . (Rendered v, MonadBuild m, TensorType a)
-        => ByteString     -- ^ File path.
+save :: forall a m v . (Rendered (Tensor v), MonadBuild m, TensorType a)
+        => ByteString    -- ^ File path.
         -> [Tensor v a]  -- ^ Tensors to save.
         -> m ControlNode
 save path xs = build $ do
@@ -330,6 +332,23 @@ reduceSum' :: (OneOf '[ Double, Float, Int32, Int64
 reduceSum' params x = CoreOps.sum' params x allAxes
   where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
 
+-- | Computes the mean of elements across dimensions of a tensor.
+-- See `TensorFlow.GenOps.Core.mean`
+reduceMean
+  :: ( TensorType a
+     , OneOf '[ Double, Float, Complex Float, Complex Double] a
+     )
+  => Tensor v a -> Tensor Build a
+reduceMean = reduceMean' id
+
+reduceMean'
+  :: ( TensorType a
+     , OneOf '[ Double, Float, Complex Float, Complex Double] a
+     )
+  => OpParams -> Tensor v a -> Tensor Build a
+reduceMean' params x = CoreOps.mean' params x allAxes
+  where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+
 -- | Create a constant vector.
 vector :: TensorType a => [a] -> Tensor Build a
 vector = vector' id
@@ -358,7 +377,7 @@ truncatedNormal' :: (MonadBuild m, OneOf '[Word16, Double, Float] a)
 truncatedNormal' = CoreOps.truncatedNormal'
 
 zeros :: forall a . (Num a, TensorType a) => Shape -> Tensor Build a
-zeros (Shape s) = CoreOps.fill (vector $ map fromIntegral s) (scalar 0)
+zeros (Shape s) = CoreOps.fill (vector s) (scalar 0)
 
 shape :: TensorType t => Tensor v t -> Tensor Build Int32
 shape = CoreOps.shape
